@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import client, { getApiErrorMessage } from "../api/client";
 import { useAuth } from "../context/AuthContext";
+import { validateRealEmail } from "../utils/authValidation";
 
 export default function LoginPage() {
   const navigate = useNavigate();
@@ -20,6 +21,11 @@ export default function LoginPage() {
 
   const handleSubmit = async (event) => {
     event.preventDefault();
+    const emailError = validateRealEmail(form.email);
+    if (emailError) {
+      setMessage(emailError);
+      return;
+    }
     
     const pwdError = validatePassword(form.password);
     if (pwdError) {
@@ -35,7 +41,7 @@ export default function LoginPage() {
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
       });
       login(data);
-      navigate("/profile");
+      navigate("/dashboard");
     } catch (error) {
       setMessage(getApiErrorMessage(error, "Unable to login."));
     }
@@ -77,11 +83,11 @@ export default function LoginPage() {
         <button type="submit" className="primary-button">Sign in</button>
       </form>
       <p className="mt-5 text-sm text-slate-600">
-        If this email is already registered and you want to create it again with a new password, use the{" "}
+        New here? Use the{" "}
         <Link to="/signup" className="font-semibold text-tide underline underline-offset-4">
           signup page
         </Link>{" "}
-        and choose the replace account option.
+        to create an account with a real email address.
       </p>
       </section>
     </main>

@@ -527,7 +527,10 @@ def _infer_role(text: str) -> str:
     lowered = (text or "").lower()
     for role in ROLE_HINTS:
         if role in lowered:
-            return role.title()
+            title = role.title()
+            if title == "Full Stack Developer":
+                return "Fullstack Developer"
+            return title
     if any(token in lowered for token in ("fastapi", "django", "flask", "spring boot", "jwt", "oauth")):
         return "Backend Developer"
     if any(token in lowered for token in ("react", "next.js", "tailwind css", "figma")):
@@ -539,8 +542,69 @@ def _infer_role(text: str) -> str:
     return ""
 
 
+def _is_likely_resume(text: str) -> bool:
+    lowered = (text or "").lower()
+    if not lowered.strip():
+        return False
+
+    # Standard section titles or indicators in resumes
+    resume_keywords = [
+        "experience", "work history", "employment", "internship", "professional history",
+        "education", "academic", "university", "college", "school", "qualification",
+        "skills", "technical skills", "technologies", "tech stack", "tools", "competencies",
+        "projects", "personal projects", "academic projects",
+        "certifications", "certificates", "publications", "achievements"
+    ]
+
+    # Count matching unique resume keywords
+    match_count = sum(1 for kw in resume_keywords if kw in lowered)
+
+    # Look for contact details (email, phone numbers, social/dev links)
+    has_email = "@" in lowered
+    
+    import re
+    has_phone = any(p in lowered for p in ["phone", "mobile", "contact", "tel:"]) or re.search(r"\b\d{10}\b", lowered) is not None
+    has_profile = any(p in lowered for p in ["linkedin.com", "github.com", "portfolio"])
+
+    # If the document is extremely long (like a textbook, monthly current affairs digest, or article), it's not a resume.
+    # A single page or two page resume is typically under 1200 words. Let's set a safe limit of 2500 words.
+    word_count = len(lowered.split())
+    if word_count > 2500:
+        return False
+
+    # Heuristic:
+    # A valid resume must have:
+    # 1. At least 2 of the main sections (experience, education, skills, projects, certifications).
+    # 2. Or, if it has at least 1 section and a clear contact indicator (email, phone, or profile link).
+    # 3. Or, if the word count is reasonable (e.g. 50-1500 words) and has clear contact details.
+    
+    # Let's count how many distinct section groups are matched:
+    section_matches = 0
+    if any(kw in lowered for kw in ["experience", "work history", "employment", "internship", "professional history"]):
+        section_matches += 1
+    if any(kw in lowered for kw in ["education", "academic", "university", "college", "school", "qualification"]):
+        section_matches += 1
+    if any(kw in lowered for kw in ["skills", "technical skills", "technologies", "tech stack", "tools", "competencies"]):
+        section_matches += 1
+    if any(kw in lowered for kw in ["projects", "personal projects", "academic projects"]):
+        section_matches += 1
+    if any(kw in lowered for kw in ["certifications", "certificates"]):
+        section_matches += 1
+
+    # Let's evaluate
+    has_contact = has_email or has_phone or has_profile
+    
+    if section_matches >= 2 or (section_matches >= 1 and has_contact):
+        return True
+
+    return False
+
+
 def analyze_document(file_bytes: bytes, filename: str, document_type: str) -> dict:
     text = extract_text_from_pdf(file_bytes)
+    if document_type == "resume" and not _is_likely_resume(text):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Please upload valid resume")
     sections = _sectionize_text(text)
     skills = extract_skills_from_text(text)
     tools = [skill for skill in skills if skill in TOOL_SKILLS]

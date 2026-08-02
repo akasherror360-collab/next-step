@@ -3,6 +3,7 @@ import { NavLink } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import { useAuth } from "../context/AuthContext";
 import client from "../api/client";
+import ThemePanel from "../components/ThemePanel";
 
 const CHAT_HISTORY_LIMIT = 30;
 const MESSAGE_HISTORY_LIMIT = 80;
@@ -116,7 +117,11 @@ export default function ChatbotPage() {
 
     loadProfilePhoto();
     window.addEventListener("storage", loadProfilePhoto);
-    return () => window.removeEventListener("storage", loadProfilePhoto);
+    window.addEventListener("nextstep-profile-photo-updated", loadProfilePhoto);
+    return () => {
+      window.removeEventListener("storage", loadProfilePhoto);
+      window.removeEventListener("nextstep-profile-photo-updated", loadProfilePhoto);
+    };
   }, [user?.id, user?.email]);
 
   useEffect(() => {
@@ -443,10 +448,11 @@ export default function ChatbotPage() {
             </button>
             <div>
               <h1 className="text-xl font-bold text-slate-950">AI Mentor</h1>
-              <p className="text-xs text-slate-400">{profile?.desired_role || "Career guidance chat"}</p>
+              <p className="text-xs text-slate-400 capitalize">{profile?.desired_role || "Career guidance chat"}</p>
             </div>
           </div>
           <div className="hidden items-center gap-2 md:flex">
+            <ThemePanel compact />
             <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700">Online</span>
             <NavLink
               to="/roadmap"

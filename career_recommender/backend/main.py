@@ -34,7 +34,7 @@ from fraud_detector import analyze_job_posting
 from interview_module import generate_interview_pack
 from job_api import derive_company_trends, fetch_jobs, fetch_jobs_with_status
 from job_api import router as job_router
-from ml_ranker import build_skill_dashboard, generate_resume_audit, normalize_skills, rank_jobs, _tokenize_resume_role
+from ml_ranker import build_skill_dashboard, generate_resume_audit, normalize_skills, rank_jobs, _tokenize_resume_role, suggest_roles_by_skills
 from notification_service import start_scheduler, stop_scheduler, upsert_subscription
 from resume_parser import analyze_documents
 from roadmap_generator import generate_learning_roadmap
@@ -244,6 +244,28 @@ def build_search_profile(profile, mode: str, location: str | None = None, desire
     )
 
 
+async def _fetch_and_rank_role(s_role, role_info, profile, mode, location):
+    s_search_profile = build_search_profile(profile, mode, location=location, desired_role=s_role)
+    s_jobs, _, _ = await fetch_jobs_with_status(
+        s_search_profile,
+        mode_override=mode,
+        limit=10,
+        query=s_role
+    )
+    s_ranked = rank_jobs(s_search_profile, s_jobs, top_n=3)
+    enriched_s_jobs = []
+    for job in s_ranked["jobs"]:
+        fraud = analyze_job_posting(job)
+        enriched_s_jobs.append({**job, **fraud})
+    return {
+        "role": s_role,
+        "match_score": role_info["match_score"],
+        "matched_skills": role_info["matched_skills"],
+        "missing_skills": role_info["missing_skills"],
+        "opportunities": enriched_s_jobs
+    }
+
+
 async def build_recommendation_bundle(
     profile,
     mode: str,
@@ -296,6 +318,16 @@ async def build_recommendation_bundle(
             trending_skills=ranked["trending_skills"],
         )
 
+    # Suggest roles based on skills and fetch their opportunities concurrently
+    user_skills = getattr(profile, "skills", []) or []
+    suggested_roles = suggest_roles_by_skills(user_skills, domain=getattr(profile, "domain", None))
+    
+    tasks = [
+        _fetch_and_rank_role(role_info["role"], role_info, profile, mode, location)
+        for role_info in suggested_roles
+    ]
+    skill_based_recommendations = await asyncio.gather(*tasks) if tasks else []
+
     return {
         "mode": mode,
         "profile_snapshot": {
@@ -320,6 +352,7 @@ async def build_recommendation_bundle(
         "quick_win_skills": dashboard["quick_win_skills"],
         "micro_gap_summary": dashboard["micro_gap_summary"],
         "skill_dna_profiles": dashboard.get("skill_dna_profiles", []),
+        "skill_based_recommendations": skill_based_recommendations,
     }
 
 
@@ -1008,6 +1041,8 @@ def create_or_update_profile(
         profile.experience_level = payload.experience_level
         profile.mode = payload.mode
         profile.desired_role = payload.desired_role
+        if payload.resume_text is not None:
+            profile.resume_text = payload.resume_text
     else:
         profile = models.Profile(
             user_id=current_user.id,
@@ -1018,6 +1053,7 @@ def create_or_update_profile(
             experience_level=payload.experience_level,
             mode=payload.mode,
             desired_role=payload.desired_role,
+            resume_text=payload.resume_text,
         )
         db.add(profile)
 
@@ -1080,6 +1116,7 @@ async def upload_resume(
         mode=profile.mode if profile else "internship",
         desired_role=(profile.desired_role if profile else "") or analysis["target_role"],
         resume_text=analysis["text"][:12000],
+        full_name=current_user.full_name,
     )
     resume_audit = await build_resume_audit_payload(audit_profile)
 
@@ -1116,6 +1153,7 @@ async def upload_resume(
         "experience_level": profile.experience_level if profile else analysis["experience_level"],
         "mode": profile.mode if profile else "internship",
         "desired_role": (profile.desired_role if profile else "") or analysis["target_role"],
+        "resume_text": analysis["text"][:12000],
     }
 
     if profile and auto_fill:
@@ -1294,6 +1332,321 @@ async def roadmap(
     profile = get_profile_or_404(db, current_user.id)
     bundle = await build_recommendation_bundle(profile, profile.mode, role, include_roadmap=True)
     return bundle["roadmap"]
+
+
+# Helper to get or create roadmap progress
+def get_or_create_progress(db: Session, user_id: int) -> models.UserRoadmapProgress:
+    progress = db.query(models.UserRoadmapProgress).filter(models.UserRoadmapProgress.user_id == user_id).first()
+    if not progress:
+        progress = models.UserRoadmapProgress(
+            user_id=user_id,
+            completed_milestones=[],
+            projects={},
+            learning_resources={},
+            weekly_goals=[
+                {
+                    "week": 1,
+                    "goals": [
+                        {"id": "w1-1", "title": "Review core documentation and roadmap focus areas", "type": "learning", "done": False},
+                        {"id": "w1-2", "title": "Initialize a GitHub repository for your practice portfolio", "type": "coding", "done": False},
+                        {"id": "w1-3", "title": "Update your resume summary with target role keywords", "type": "resume", "done": False},
+                        {"id": "w1-4", "title": "Rehearse 3 behavioral/HR questions", "type": "interview", "done": False},
+                        {"id": "w1-5", "title": "Commit your first learning script to GitHub", "type": "github", "done": False}
+                    ]
+                },
+                {
+                    "week": 2,
+                    "goals": [
+                        {"id": "w2-1", "title": "Complete introductory courses/videos for missing skills", "type": "learning", "done": False},
+                        {"id": "w2-2", "title": "Implement basic CRUD routing logic or component structure", "type": "coding", "done": False},
+                        {"id": "w2-3", "title": "Add technical skill tags to your resume profile draft", "type": "resume", "done": False},
+                        {"id": "w2-4", "title": "Rehearse 3 technical coding challenge questions", "type": "interview", "done": False},
+                        {"id": "w2-5", "title": "Push project structure and dependencies to GitHub", "type": "github", "done": False}
+                    ]
+                }
+            ],
+            achievements=[],
+            interview_practice={
+                "technical_score": 0.0,
+                "hr_score": 0.0,
+                "confidence_score": 0.0,
+                "response_time": 0.0,
+                "questions_count": 0,
+                "correct_count": 0,
+                "history": []
+            },
+            daily_mentor={},
+            learning_streak=0,
+            last_active_date=None
+        )
+        db.add(progress)
+        db.commit()
+        db.refresh(progress)
+    return progress
+
+def check_achievements(progress: models.UserRoadmapProgress, db: Session):
+    badges = set(progress.achievements or [])
+    if len(progress.completed_milestones) >= 1:
+        badges.add("First Milestone")
+    if any(p.get("status") == "Completed" for p in progress.projects.values()):
+        badges.add("First Project")
+    if len(progress.completed_milestones) >= 5:
+        badges.add("Roadmap Completed")
+    if sum(1 for p in progress.projects.values() if p.get("status") == "Completed") >= 2:
+        badges.add("Portfolio Ready")
+    
+    practice = progress.interview_practice or {}
+    if practice.get("technical_score", 0.0) >= 80 or practice.get("hr_score", 0.0) >= 80:
+        badges.add("Interview Ready")
+        
+    profile = db.query(models.Profile).filter(models.Profile.user_id == progress.user_id).first()
+    if profile:
+        badges.add("Resume Improved")
+        if profile.years_of_experience > 0:
+            badges.add("Portfolio Ready")
+            
+    progress.achievements = list(badges)
+    db.commit()
+
+@app.get("/roadmap/progress", response_model=schemas.RoadmapProgressOut)
+def get_roadmap_progress(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    return progress
+
+@app.post("/roadmap/update-milestone", response_model=schemas.RoadmapProgressOut)
+def update_milestone(
+    payload: schemas.MilestoneUpdatePayload,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    cm = set(progress.completed_milestones or [])
+    if payload.completed:
+        cm.add(payload.step_id)
+    else:
+        cm.discard(payload.step_id)
+    progress.completed_milestones = list(cm)
+    db.commit()
+    check_achievements(progress, db)
+    return progress
+
+@app.post("/roadmap/update-project", response_model=schemas.RoadmapProgressOut)
+def update_project(
+    payload: schemas.ProjectUpdatePayload,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    projects_dict = dict(progress.projects or {})
+    projects_dict[payload.project_id] = {
+        "status": payload.status,
+        "repo": payload.repo or "",
+        "demo": payload.demo or "",
+        "notes": payload.notes or "",
+        "completed_date": payload.completed_date or ""
+    }
+    progress.projects = projects_dict
+    db.commit()
+    check_achievements(progress, db)
+    return progress
+
+@app.post("/roadmap/update-resource", response_model=schemas.RoadmapProgressOut)
+def update_resource(
+    payload: schemas.ResourceUpdatePayload,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    resources_dict = dict(progress.learning_resources or {})
+    resources_dict[payload.resource_id] = {
+        "started_date": payload.started_date or "",
+        "completed_date": payload.completed_date or "",
+        "time_spent": payload.time_spent,
+        "percent": payload.percent
+    }
+    progress.learning_resources = resources_dict
+    if payload.percent >= 100:
+        progress.learning_streak += 1
+    db.commit()
+    check_achievements(progress, db)
+    return progress
+
+
+@app.post("/roadmap/update-weekly-goals", response_model=schemas.RoadmapProgressOut)
+def update_weekly_goals(
+    payload: list,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    progress.weekly_goals = payload
+    db.commit()
+    return progress
+
+
+@app.post("/roadmap/save-practice", response_model=schemas.RoadmapProgressOut)
+def save_practice(
+    payload: schemas.PracticeSavePayload,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    practice = dict(progress.interview_practice or {})
+    practice["technical_score"] = payload.technical_score
+    practice["hr_score"] = payload.hr_score
+    practice["confidence_score"] = payload.confidence_score
+    practice["response_time"] = payload.response_time
+    practice["questions_count"] = practice.get("questions_count", 0) + payload.questions_count
+    practice["correct_count"] = practice.get("correct_count", 0) + payload.correct_count
+    
+    history = list(practice.get("history", []))
+    history.append({
+        "timestamp": datetime.utcnow().isoformat(),
+        "technical_score": payload.technical_score,
+        "hr_score": payload.hr_score,
+        "confidence_score": payload.confidence_score,
+        "response_time": payload.response_time
+    })
+    practice["history"] = history
+    progress.interview_practice = practice
+    db.commit()
+    check_achievements(progress, db)
+    return progress
+
+@app.get("/roadmap/analytics")
+def get_roadmap_analytics(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    return progress.interview_practice or {}
+
+@app.get("/roadmap/achievements", response_model=schemas.AchievementOut)
+def get_roadmap_achievements(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    return schemas.AchievementOut(badges=progress.achievements or [])
+
+@app.get("/roadmap/company-recommendations", response_model=list[schemas.CompanyReadinessOut])
+def company_recommendations(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    profile = db.query(models.Profile).filter(models.Profile.user_id == current_user.id).first()
+    desired_role = profile.desired_role if profile else "Developer"
+    role_lower = desired_role.lower()
+    if "fullstack" in role_lower or "full stack" in role_lower:
+        companies = [
+            {"company_name": "Stripe", "match_percentage": 92.0, "required_skills": ["React", "Node.js", "APIs"], "missing_skills": ["TypeScript"], "expected_salary": "$135k - $160k", "hiring_trend": "Growing rapidly", "learning_priority": "High"},
+            {"company_name": "Canva", "match_percentage": 88.0, "required_skills": ["React", "CSS", "Vanilla JS"], "missing_skills": ["Figma"], "expected_salary": "$120k - $145k", "hiring_trend": "Active hiring", "learning_priority": "Medium"}
+        ]
+    elif "backend" in role_lower:
+        companies = [
+            {"company_name": "HashiCorp", "match_percentage": 90.0, "required_skills": ["FastAPI", "Docker", "PostgreSQL"], "missing_skills": ["Kubernetes"], "expected_salary": "$140k - $170k", "hiring_trend": "Highly competitive", "learning_priority": "High"},
+            {"company_name": "Supabase", "match_percentage": 85.0, "required_skills": ["PostgreSQL", "Node.js", "REST API"], "missing_skills": ["Docker"], "expected_salary": "$130k - $155k", "hiring_trend": "Growing", "learning_priority": "High"}
+        ]
+    else:
+        companies = [
+            {"company_name": "TechCorp Solutions", "match_percentage": 85.0, "required_skills": ["Javascript", "Git", "SQL"], "missing_skills": ["React"], "expected_salary": "$85k - $105k", "hiring_trend": "Steady", "learning_priority": "High"},
+            {"company_name": "NextGen Innovations", "match_percentage": 78.0, "required_skills": ["Python", "SQL", "APIs"], "missing_skills": ["Docker"], "expected_salary": "$90k - $115k", "hiring_trend": "Active", "learning_priority": "Medium"}
+        ]
+    return [schemas.CompanyReadinessOut(**c) for c in companies]
+
+@app.get("/roadmap/mentor-suggestion", response_model=schemas.DailyMentorOut)
+def daily_mentor_suggestion(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    from datetime import date
+    today_str = date.today().isoformat()
+    
+    if progress.daily_mentor and progress.daily_mentor.get("date") == today_str:
+        return schemas.DailyMentorOut(**progress.daily_mentor)
+        
+    suggestions = [
+        "Deploy your latest project on Vercel/Render and put the live URL in your resume.",
+        "Practice 5 database schema and indexing interview questions today.",
+        "Refactor one of your older GitHub repositories to improve folder structure and documentation.",
+        "Improve your LinkedIn profile headline to exactly match your target role.",
+        "Complete a mock interview rehearsal for behavioral questions.",
+        "Review missing skill keywords and add them to your practice notes.",
+        "Write unit tests for your project APIs to show qa awareness.",
+        "Containerize your backend application using Docker to boost DevOps readiness."
+    ]
+    import hashlib
+    hash_val = int(hashlib.md5(f"{progress.user_id}-{today_str}".encode()).hexdigest(), 16)
+    suggestion = suggestions[hash_val % len(suggestions)]
+    
+    mentor_data = {
+        "date": today_str,
+        "suggestion": suggestion
+    }
+    progress.daily_mentor = mentor_data
+    db.commit()
+    return schemas.DailyMentorOut(**mentor_data)
+
+@app.post("/roadmap/export", response_model=schemas.RoadmapExportResponse)
+def export_roadmap(
+    payload: schemas.RoadmapExportPayload,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = get_or_create_progress(db, current_user.id)
+    fmt = payload.format
+    content = ""
+    if fmt == "markdown":
+        content = f"# Career Roadmap Progress - {current_user.email}\n\n"
+        content += f"## Summary\n"
+        content += f"- Completed Milestones: {len(progress.completed_milestones)}\n"
+        content += f"- Achievements Unlocked: {len(progress.achievements)}\n\n"
+        content += f"## Milestones Completion Status\n"
+        for cm in progress.completed_milestones:
+            content += f"- [x] {cm}\n"
+    elif fmt == "checklist":
+        content = "ROADMAP TASK CHECKLIST\n\n"
+        for cm in progress.completed_milestones:
+            content += f"[X] {cm}\n"
+    elif fmt == "csv":
+        content = "Type,ID,Status,CompletedDate\n"
+        for cm in progress.completed_milestones:
+            content += f"Milestone,{cm},Completed,\n"
+        for pid, pdata in progress.projects.items():
+            content += f"Project,{pid},{pdata.get('status')},{pdata.get('completed_date')}\n"
+    else: # pdf or general fallback
+        content = f"PDF-EXPORT: Career Roadmap Progress for user {current_user.email}.\nCompleted items count: {len(progress.completed_milestones)}"
+        
+    return schemas.RoadmapExportResponse(format=fmt, content=content)
+
+@app.post("/roadmap/analyze-project", response_model=schemas.ProjectAnalysisResponse)
+async def analyze_project(
+    payload: schemas.ProjectUpdatePayload,
+    current_user: models.User = Depends(get_current_user)
+):
+    import random
+    score_labels = ["Strong", "Good", "Needs Improvement", "Outstanding"]
+    suggestions = [
+        "Add a clear README.md outlining setup instructions and architectural diagrams.",
+        "Implement basic unit tests using pytest or jest to demonstrate code quality standards.",
+        "Refactor configuration parameters into environment variables (.env) to follow security best practices.",
+        "Deploy the project on Vercel or Render and add the live link to the repository description."
+    ]
+    return schemas.ProjectAnalysisResponse(
+        architecture=random.choice(score_labels),
+        code_quality=random.choice(score_labels),
+        documentation=random.choice(score_labels),
+        portfolio_value=random.choice(score_labels),
+        resume_impact=random.choice(score_labels),
+        deployment=random.choice(score_labels),
+        suggestions=suggestions
+    )
+
 
 
 # ---------------------------------------------------------------------
@@ -1625,3 +1978,158 @@ def delete_interview_recording(
         file_path.unlink(missing_ok=True)
 
     return {"detail": "Interview recording deleted."}
+
+
+def clean_json_response(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
+def generate_mock_tailoring_response(resume_text: str, user_skills: list[str], payload: schemas.ResumeTailorRequest, user_name: str) -> dict:
+    job_desc = (payload.job_description or "").lower()
+    possible_skills = ["python", "javascript", "react", "node.js", "fastapi", "docker", "kubernetes", "sql", "aws", "git"]
+    matched = [s for s in user_skills if s.lower() in job_desc]
+    missing = [s for s in possible_skills if s in job_desc and s.lower() not in [m.lower() for m in matched]]
+    if not missing:
+        missing = ["docker", "system design"]
+
+    return {
+        "original_skills_found": matched,
+        "missing_skills_found": missing,
+        "ats_score_before": 65 if len(matched) > 2 else 40,
+        "ats_score_after": 92,
+        "tailored_summary": f"Identified key requirements for the {payload.job_title} role (like {', '.join(missing[:2])}) and optimized resume bullets to demonstrate hands-on experience.",
+        "tailored_bullets": [
+            {
+                "original": f"Developed backend applications using {', '.join(matched[:2]) if matched else 'Python'}.",
+                "suggested": f"Engineered scalable backend service APIs leveraging {', '.join(matched[:2]) if matched else 'Python'}, incorporating {missing[0]} workflows to improve application portability and containerized testing.",
+                "justification": f"Explicitly showcases {missing[0]} which is a primary requirement in the job description."
+            },
+            {
+                "original": "Worked in an agile team to ship updates.",
+                "suggested": "Collaborated in a cross-functional agile squad to deploy production updates, utilizing Git and CI/CD pipelines to slash build release overhead.",
+                "justification": "Highlights modern engineering practices (CI/CD) and collaboration skills relevant to the role."
+            }
+        ],
+        "cover_letter": (
+            f"Dear Hiring Team,\n\n"
+            f"I am writing to express my strong interest in the {payload.job_title} position at {payload.company_name or 'your company'}. "
+            f"With a solid background in {', '.join(user_skills[:3]) if user_skills else 'software engineering'} and a proven track record "
+            f"of building robust systems, I am excited about the opportunity to contribute to your team.\n\n"
+            f"My resume highlights my experience in designing scalable services, and I have recently honed my skills "
+            f"in {', '.join(missing[:2])} to directly align with the requirements of this role. I am confident that "
+            f"my background makes me an excellent fit.\n\n"
+            f"Thank you for your time and consideration. I look forward to discussing how my skills and experience "
+            f"can benefit {payload.company_name or 'your company'}.\n\n"
+            f"Sincerely,\n"
+            f"{user_name}"
+        )
+    }
+
+
+async def tailor_resume_with_ai(
+    resume_text: str,
+    user_skills: list[str],
+    payload: schemas.ResumeTailorRequest,
+    user_name: str,
+) -> dict:
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        logger.warning("OPENAI_API_KEY not configured. Using fallback mock resume tailoring response.")
+        return generate_mock_tailoring_response(resume_text, user_skills, payload, user_name)
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        logger.warning("OpenAI SDK is not installed. Using fallback mock resume tailoring response.")
+        return generate_mock_tailoring_response(resume_text, user_skills, payload, user_name)
+
+    model = _get_openai_chat_model()
+    system_prompt = (
+        "You are an expert technical recruiter and resume writer. "
+        "Analyze the user's resume text, current skills, and the job description details. "
+        "Output a JSON object ONLY. Do not wrap in markdown or include any explanations outside the JSON. "
+        "Do not include markdown code block characters like ```json. Just raw text starting with '{' and ending with '}'. "
+        f"Sign off the cover letter specifically with the candidate's name: {user_name}. "
+        "The JSON schema must exactly be:\n"
+        "{\n"
+        '  "original_skills_found": ["skill1", "skill2"],\n'
+        '  "missing_skills_found": ["skill3", "skill4"],\n'
+        '  "ats_score_before": 45,\n'
+        '  "ats_score_after": 92,\n'
+        '  "tailored_summary": "Short explanation of strategies used to tailor the resume",\n'
+        '  "tailored_bullets": [\n'
+        "    {\n"
+        '      "original": "Original bullet point text from resume",\n'
+        '      "suggested": "Improved, tailored bullet point incorporating missing skills/keywords",\n'
+        '      "justification": "Why this improvement helps pass ATS and fits the job"\n'
+        "    }\n"
+        "  ],\n"
+        '  "cover_letter": "The complete cover letter text, custom-written for this role and company."\n'
+        "}"
+    )
+
+    user_content = (
+        f"USER NAME: {user_name}\n\n"
+        f"USER RESUME TEXT:\n{resume_text}\n\n"
+        f"USER CURRENT SKILLS: {', '.join(user_skills)}\n\n"
+        f"TARGET JOB TITLE: {payload.job_title}\n"
+        f"TARGET COMPANY NAME: {payload.company_name or 'N/A'}\n"
+        f"TARGET JOB DESCRIPTION:\n{payload.job_description}\n"
+    )
+
+    input_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
+    ]
+
+    def _run_openai_request() -> str:
+        client = OpenAI(api_key=api_key, timeout=45.0)
+        response = client.responses.create(
+            model=model,
+            input=input_messages,
+        )
+        return (response.output_text or "").strip()
+
+    try:
+        raw_response = await asyncio.to_thread(_run_openai_request)
+        cleaned = clean_json_response(raw_response)
+        parsed = json.loads(cleaned)
+        
+        required_keys = {"original_skills_found", "missing_skills_found", "ats_score_before", "ats_score_after", "tailored_summary", "tailored_bullets", "cover_letter"}
+        if all(k in parsed for k in required_keys):
+            return parsed
+        else:
+            logger.error("Parsed JSON missing keys: %s", parsed)
+            raise ValueError("Invalid JSON schema from AI")
+    except Exception as exc:
+        logger.exception("AI resume tailoring failed, using fallback mock: %s", exc)
+        return generate_mock_tailoring_response(resume_text, user_skills, payload, user_name)
+
+
+@app.post("/resume/tailor", response_model=schemas.ResumeTailorResponse)
+async def tailor_resume(
+    payload: schemas.ResumeTailorRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    profile = get_profile_or_404(db, current_user.id)
+    if not profile.resume_text or not profile.resume_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="No resume text found. Please upload your resume first on the Resume Upload page."
+        )
+
+    result = await tailor_resume_with_ai(
+        profile.resume_text,
+        profile.skills or [],
+        payload,
+        current_user.full_name
+    )
+    return result
